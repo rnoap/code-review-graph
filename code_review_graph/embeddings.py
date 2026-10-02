@@ -1245,13 +1245,72 @@ class EmbeddingStore:
         return embedded
 
     def search(self, query: str, limit: int = 20) -> list[tuple[str, float]]:
-        """Search for nodes by semantic similarity."""
+        """Search for nodes by semantic similarity.
+
+        Every stored vector of the current provider is scored against the
+        query. With numpy installed (the ``embeddings`` extra pulls it in),
+        each chunk of rows is scored with one matrix-vector product instead of
+        a Python loop over every component of every row, which took tens of
+        seconds per search over tens of thousands of high-dimensional vectors.
+        Without numpy, :meth:`_search_pure_python` runs that loop instead.
+
+        Both return the same ranking: a vector whose dimensionality differs
+        from the query's, or whose norm is zero, scores 0.0, and equal scores
+        keep the order the rows were read in.
+        """
         if not self.provider:
             return []
 
         provider_name = self.provider.name
         query_vec = self.provider.embed_query(query)
 
+        try:
+            import numpy as np
+        except ImportError:
+            return self._search_pure_python(query_vec, provider_name, limit)
+
+        # float64, like the loop's Python floats: the stored components are
+        # float32, so every product is exact and only the summation order
+        # differs between the two paths.
+        query_arr = np.asarray(query_vec, dtype=np.float64)
+        dims = int(query_arr.shape[0])
+        query_norm = float(np.sqrt(query_arr @ query_arr))
+        blob_size = dims * 4  # float32 components, see _encode_vector
+
+        names: list[str] = []
+        chunk_scores = []
+        cursor = self._conn.execute(
+            "SELECT qualified_name, vector FROM embeddings WHERE provider = ?",
+            (provider_name,),
+        )
+        chunk_size = 500
+        while True:
+            rows = cursor.fetchmany(chunk_size)
+            if not rows:
+                break
+            scores = np.zeros(len(rows))
+            same_dims = [i for i, row in enumerate(rows) if len(row["vector"]) == blob_size]
+            if same_dims and query_norm:
+                matrix = np.frombuffer(
+                    b"".join(rows[i]["vector"] for i in same_dims), dtype=np.float32,
+                ).reshape(len(same_dims), dims).astype(np.float64)
+                norms = np.sqrt(np.einsum("ij,ij->i", matrix, matrix))
+                norms[norms == 0.0] = np.inf  # a zero vector scores 0.0
+                scores[same_dims] = (matrix @ query_arr) / (norms * query_norm)
+            names.extend(row["qualified_name"] for row in rows)
+            chunk_scores.append(scores)
+
+        if not names:
+            return []
+        all_scores = np.concatenate(chunk_scores)
+        # Stable, like list.sort(reverse=True): equal scores keep read order.
+        order = np.argsort(-all_scores, kind="stable")[:limit]
+        return [(names[i], float(all_scores[i])) for i in order]
+
+    def _search_pure_python(
+        self, query_vec: list[float], provider_name: str, limit: int,
+    ) -> list[tuple[str, float]]:
+        """Score every stored vector one component at a time (no numpy)."""
         # Process in chunks, only matching current provider
         scored: list[tuple[str, float]] = []
         cursor = self._conn.execute(

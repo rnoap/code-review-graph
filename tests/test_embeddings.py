@@ -2,6 +2,8 @@
 
 import json
 import os
+import random
+import sys
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -228,6 +230,120 @@ class TestEmbeddingStore:
             with pytest.raises(RuntimeError, match="rate limited"):
                 store.embed_nodes(nodes, batch_size=2)
             assert store.count() == 2
+            store.close()
+
+
+class TestEmbeddingStoreSearch:
+    """``search`` scores with numpy when it can, and ranks like the Python loop."""
+
+    PROVIDER = "test:provider"
+
+    class _Provider:
+        name = "test:provider"
+
+        def __init__(self, query_vec):
+            self.query_vec = query_vec
+
+        def embed(self, texts):
+            raise AssertionError("search must not embed stored vectors")
+
+        def embed_query(self, text):
+            return list(self.query_vec)
+
+        @property
+        def dimension(self):
+            return len(self.query_vec)
+
+    def _store(self, tmp_path, query_vec):
+        provider = self._Provider(query_vec)
+        with patch("code_review_graph.embeddings.get_provider", return_value=provider):
+            return EmbeddingStore(tmp_path / "embeddings.db")
+
+    @staticmethod
+    def _insert(store, name, vec, provider=PROVIDER):
+        store._conn.execute(
+            "INSERT INTO embeddings (qualified_name, vector, text_hash, provider) "
+            "VALUES (?, ?, ?, ?)",
+            (name, _encode_vector(vec), "hash", provider),
+        )
+
+    def test_matches_the_python_loop(self, tmp_path):
+        pytest.importorskip("numpy")
+        rng = random.Random(7)
+        query = [rng.uniform(-1.0, 1.0) for _ in range(24)]
+        store = self._store(tmp_path, query)
+        try:
+            # 1234 rows cross the 500-row chunk boundary twice.
+            for i in range(1234):
+                vec = [rng.uniform(-1.0, 1.0) for _ in range(24)]
+                self._insert(store, f"file.py::func_{i}", vec)
+
+            expected = store._search_pure_python(query, self.PROVIDER, 1234)
+            results = store.search("query", limit=1234)
+
+            assert [name for name, _ in results] == [name for name, _ in expected]
+            for (_, score), (_, want) in zip(results, expected):
+                assert score == pytest.approx(want, abs=1e-12)
+        finally:
+            store.close()
+
+    def test_zero_norm_and_other_dimensions_score_zero_in_read_order(self, tmp_path):
+        pytest.importorskip("numpy")
+        store = self._store(tmp_path, [1.0, 0.0, 0.0])
+        try:
+            self._insert(store, "zero_norm", [0.0, 0.0, 0.0])
+            self._insert(store, "two_dims", [1.0, 0.0])
+            self._insert(store, "orthogonal", [0.0, 1.0, 0.0])
+            self._insert(store, "aligned", [2.0, 0.0, 0.0])
+            self._insert(store, "other_provider", [1.0, 0.0, 0.0], provider="other:x")
+
+            results = store.search("query", limit=10)
+
+            assert results == [
+                ("aligned", 1.0),
+                ("zero_norm", 0.0),
+                ("two_dims", 0.0),
+                ("orthogonal", 0.0),
+            ]
+            assert results == store._search_pure_python([1.0, 0.0, 0.0], self.PROVIDER, 10)
+        finally:
+            store.close()
+
+    def test_zero_query_scores_every_row_zero_and_limit_applies(self, tmp_path):
+        pytest.importorskip("numpy")
+        store = self._store(tmp_path, [0.0, 0.0])
+        try:
+            for name in ("a", "b", "c"):
+                self._insert(store, name, [1.0, 2.0])
+
+            assert store.search("query", limit=2) == [("a", 0.0), ("b", 0.0)]
+            assert store.search("query", limit=0) == []
+        finally:
+            store.close()
+
+    def test_empty_index_returns_nothing(self, tmp_path):
+        store = self._store(tmp_path, [1.0, 0.0])
+        try:
+            assert store.search("query") == []
+        finally:
+            store.close()
+
+    def test_falls_back_to_the_python_loop_without_numpy(self, tmp_path):
+        store = self._store(tmp_path, [1.0, 0.0])
+        try:
+            self._insert(store, "a", [0.0, 1.0])
+            self._insert(store, "b", [1.0, 1.0])
+
+            with patch.dict(sys.modules, {"numpy": None}), patch.object(
+                store, "_search_pure_python", wraps=store._search_pure_python,
+            ) as loop:
+                results = store.search("query", limit=5)
+
+            loop.assert_called_once_with([1.0, 0.0], self.PROVIDER, 5)
+            assert [name for name, _ in results] == ["b", "a"]
+            assert results[0][1] == pytest.approx(2 ** -0.5)
+            assert results[1][1] == 0.0
+        finally:
             store.close()
 
 
