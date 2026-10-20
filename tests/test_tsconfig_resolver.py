@@ -677,10 +677,6 @@ class TestExtendsAnchoringMatchesTsc:
                 legacy_target.resolve()
             )
 
-    @pytest.mark.xfail(strict=True, reason=(
-        "PR #1111 follows the symlink to the extended config's real directory; "
-        "tsc anchors baseUrl/paths where the link sits"
-    ))
     @pytest.mark.parametrize("shared_options", [
         {"baseUrl": ".", "paths": {"@app/*": ["src/*"]}},
         {"paths": {"@app/*": ["./src/*"]}},
@@ -709,10 +705,35 @@ class TestExtendsAnchoringMatchesTsc:
         result = TsconfigResolver().resolve_alias("@app/util", str(importer))
         assert result == str(util.resolve())
 
-    @pytest.mark.xfail(strict=True, reason=(
-        "PR #1111 keeps the inherited baseUrl anchor when a child sets "
-        "baseUrl to null; tsc unsets it"
-    ))
+    @pytest.mark.parametrize("shared_options", [
+        {"baseUrl": "..", "paths": {"@app/*": ["src/*"]}},
+        {"paths": {"@app/*": ["../src/*"]}},
+    ], ids=["baseUrl", "paths-only"])
+    def test_base_config_in_a_symlinked_directory_climbs_from_the_link(
+        self, tmp_path, shared_options,
+    ):
+        # tsc normalizes ``..`` lexically, so it climbs out of the directory the
+        # config was opened through (apps/api/shared), not out of the one the
+        # symlink points to (tools/shared). Checked with tsc 5.9.3 and 6.0.3.
+        _write_json(tmp_path / "tools" / "shared" / "tsconfig.json", {
+            "compilerOptions": shared_options,
+        })
+        _write_source(tmp_path / "tools" / "src" / "util.ts")  # where ``..`` lands physically
+        link = tmp_path / "apps" / "api" / "shared"
+        link.parent.mkdir(parents=True)
+        try:
+            os.symlink(os.path.join("..", "..", "tools", "shared"), link, target_is_directory=True)
+        except (OSError, NotImplementedError):
+            pytest.skip("symlinks are not available")
+        _write_json(tmp_path / "apps" / "api" / "tsconfig.json", {
+            "extends": "./shared/tsconfig.json",
+        })
+        util = _write_source(tmp_path / "apps" / "api" / "src" / "util.ts")
+        importer = _write_source(tmp_path / "apps" / "api" / "src" / "main.ts")
+
+        result = TsconfigResolver().resolve_alias("@app/util", str(importer))
+        assert result == str(util.resolve())
+
     def test_child_null_base_url_unsets_the_inherited_base_url(self, tmp_path):
         # tsc treats ``null`` in an extending config as "unset the inherited
         # value": paths then resolve against the config that declared them.

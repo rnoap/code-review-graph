@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 from pathlib import Path
 from typing import Optional
@@ -61,7 +62,7 @@ class TsconfigResolver:
                 or config.get("_paths_dir")
                 or config.get("_tsconfig_dir", "")
             )
-            return self._match_and_probe(import_str, paths, Path(anchor).resolve())
+            return self._match_and_probe(import_str, paths, Path(anchor))
         except (OSError, ValueError, TypeError):
             logger.debug(
                 "TsconfigResolver: unexpected error for %s", file_path, exc_info=True,
@@ -116,7 +117,10 @@ class TsconfigResolver:
         them, so a root ``tsconfig.base.json`` extended from ``apps/api/`` still
         maps ``libs/*`` to ``<root>/libs/*``. The absolute anchors are kept in
         ``_base_url_dir`` and ``_paths_dir`` and inherited unchanged until a
-        config down the chain declares its own.
+        config down the chain declares its own; ``"baseUrl": null`` unsets the
+        inherited ``baseUrl``. As in tsc, a config is located by the path it was
+        opened through, normalized without following symlinks, so a base config
+        reached through a symlink anchors where the link sits.
         """
         canonical = str(tsconfig_path.resolve())
         if canonical in seen:
@@ -141,7 +145,7 @@ class TsconfigResolver:
 
         extends: Optional[str] = data.get("extends")
         if extends and isinstance(extends, str) and extends.startswith("."):
-            parent_path = (tsconfig_path.parent / extends).resolve()
+            parent_path = Path(os.path.abspath(tsconfig_path.parent / extends))
             if not parent_path.suffix:
                 parent_path = parent_path.with_suffix(".json")
             if parent_path.is_file():
@@ -155,11 +159,14 @@ class TsconfigResolver:
         child_opts: dict = data.get("compilerOptions", {})
         result.setdefault("compilerOptions", {}).update(child_opts)
         if isinstance(child_opts, dict):
-            config_dir = tsconfig_path.parent.resolve()
-            if isinstance(child_opts.get("baseUrl"), str):
-                result["_base_url_dir"] = str((config_dir / child_opts["baseUrl"]).resolve())
+            config_dir = os.path.abspath(tsconfig_path.parent)
+            base_url = child_opts.get("baseUrl")
+            if isinstance(base_url, str):
+                result["_base_url_dir"] = os.path.normpath(os.path.join(config_dir, base_url))
+            elif base_url is None and "baseUrl" in child_opts:
+                result.pop("_base_url_dir", None)
             if "paths" in child_opts:
-                result["_paths_dir"] = str(config_dir)
+                result["_paths_dir"] = config_dir
 
         compiler_options = result.get("compilerOptions", {})
         if "baseUrl" in compiler_options:
@@ -241,7 +248,10 @@ class TsconfigResolver:
                 else:
                     mapped = replacement
 
-                candidate_base = (base_dir / mapped).resolve()
+                # Normalized before it is resolved, as tsc does: a ``..`` climbs
+                # from the anchor as written, not from where a symlink in it
+                # leads.
+                candidate_base = Path(os.path.normpath(base_dir / mapped)).resolve()
                 found = _probe_path(candidate_base)
                 if found:
                     return str(found)
